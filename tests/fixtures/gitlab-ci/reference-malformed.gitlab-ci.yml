@@ -1,0 +1,41 @@
+# Exercises all malformed !reference variants
+# Each of these should parse without crashing
+
+# Malformed: !reference with a string instead of array
+job-string-ref:
+  stage: test
+  script: !reference "not-an-array"
+
+# Malformed: empty path array
+job-empty-path:
+  stage: test
+  script: !reference []
+
+# Circular: self-reference
+job-self-cycle:
+  stage: test
+  script: !reference [job-self-cycle, script]
+
+# Circular: mutual reference
+job-a-cycle:
+  stage: test
+  script: !reference [job-b-cycle, script]
+
+job-b-cycle:
+  stage: test
+  script: !reference [job-a-cycle, script]
+
+# Unresolvable: path to nonexistent target in rules
+job-external-rules:
+  stage: test
+  script:
+    - echo "test"
+  rules:
+    - !reference [.nonexistent, rules]
+
+# Unresolvable: path to nonexistent target in extends
+job-external-extends:
+  stage: test
+  script:
+    - echo "test"
+  extends: !reference [.external_template, build_job]

@@ -1,5 +1,9 @@
 use std::collections::HashSet;
 
+/// Maximum recursion depth for reference resolution.
+/// Prevents stack overflows from deeply nested or malformed documents.
+const MAX_RESOLVE_DEPTH: usize = 100;
+
 /// Resolve `!reference` tags within a single YAML document tree.
 ///
 /// Walks the document tree recursively. For each `Value::Tagged { tag, value }`
@@ -9,34 +13,42 @@ use std::collections::HashSet;
 /// - If target found: replaces the Tagged node with the resolved value, then recurses
 /// - If target not found: leaves unresolved
 ///
-/// Maintains a resolution chain (`HashSet<Vec<String>>`) for cycle detection.
+/// Maintains a resolution chain (`HashSet<Vec<String>>`) for cycle detection
+/// and a depth counter to prevent runaway recursion.
 pub fn resolve_references(doc: &serde_yaml::Value) -> serde_yaml::Value {
     let mut chain = HashSet::new();
-    resolve_node(doc, doc, &mut chain)
+    resolve_node(doc, doc, &mut chain, 0)
 }
 
 fn resolve_node(
     node: &serde_yaml::Value,
     root: &serde_yaml::Value,
     chain: &mut HashSet<Vec<String>>,
+    depth: usize,
 ) -> serde_yaml::Value {
+    if depth > MAX_RESOLVE_DEPTH {
+        return node.clone();
+    }
+
     match node {
         serde_yaml::Value::Tagged(tagged) if tagged.tag == "!reference" => {
-            resolve_reference_tag(tagged, root, chain)
+            resolve_reference_tag(tagged, root, chain, depth)
         }
         serde_yaml::Value::Sequence(seq) => {
+            let next_depth = depth + 1;
             let resolved: Vec<serde_yaml::Value> = seq
                 .iter()
-                .map(|item| resolve_node(item, root, chain))
+                .map(|item| resolve_node(item, root, chain, next_depth))
                 .collect();
             serde_yaml::Value::Sequence(resolved)
         }
         serde_yaml::Value::Mapping(map) => {
+            let next_depth = depth + 1;
             let resolved: serde_yaml::Mapping = map
                 .iter()
                 .map(|(k, v)| {
-                    let resolved_k = resolve_node(k, root, chain);
-                    let resolved_v = resolve_node(v, root, chain);
+                    let resolved_k = resolve_node(k, root, chain, next_depth);
+                    let resolved_v = resolve_node(v, root, chain, next_depth);
                     (resolved_k, resolved_v)
                 })
                 .collect();
@@ -50,7 +62,12 @@ fn resolve_reference_tag(
     tagged: &serde_yaml::value::TaggedValue,
     root: &serde_yaml::Value,
     chain: &mut HashSet<Vec<String>>,
+    depth: usize,
 ) -> serde_yaml::Value {
+    if depth > MAX_RESOLVE_DEPTH {
+        return tagged.value.clone();
+    }
+
     let path = match extract_path(&tagged.value) {
         Some(p) => p,
         // Malformed tag (not a sequence) → leave as-is (don't crash)
@@ -73,7 +90,7 @@ fn resolve_reference_tag(
 
     // Must keep path in chain during transitive resolution so cycles are detected
     let output = match result {
-        Some(resolved) => resolve_node(resolved, root, chain),
+        Some(resolved) => resolve_node(resolved, root, chain, depth + 1),
         // Target not found → replace with inner path array for downstream
         None => tagged.value.clone(),
     };
@@ -382,5 +399,69 @@ build:
                 .unwrap(),
             &serde_yaml::Value::String("$CI_COMMIT_BRANCH == \"main\"".to_string())
         );
+    }
+
+    #[test]
+    fn test_resolve_max_depth_safety() {
+        // A chain of 102 sequential references should hit the depth limit
+        // without crashing (stack overflow).
+        let yaml = serde_yaml::from_str::<serde_yaml::Value>(
+            r#"
+job_0:
+  script: !reference [job_1, script]
+job_1:
+  script: !reference [job_2, script]
+job_2:
+  script: !reference [job_3, script]
+job_3:
+  script: echo "leaf"
+"#,
+        )
+        .unwrap();
+
+        // Should complete without crash. Depth of 4 references << MAX_RESOLVE_DEPTH
+        // so all should resolve normally.
+        let resolved = resolve_references(&yaml);
+
+        let job_0 = resolved
+            .as_mapping()
+            .unwrap()
+            .get(&serde_yaml::Value::String("job_0".to_string()))
+            .unwrap();
+        let script_0 = job_0
+            .as_mapping()
+            .unwrap()
+            .get(&serde_yaml::Value::String("script".to_string()))
+            .unwrap();
+        assert_eq!(
+            script_0,
+            &serde_yaml::Value::String("echo \"leaf\"".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_self_reference_cycle() {
+        // Self-referencing !reference should be replaced with path array
+        let yaml = serde_yaml::from_str::<serde_yaml::Value>(
+            r#"
+job:
+  script: !reference [job, script]
+"#,
+        )
+        .unwrap();
+
+        let resolved = resolve_references(&yaml);
+
+        let job = resolved
+            .as_mapping()
+            .unwrap()
+            .get(&serde_yaml::Value::String("job".to_string()))
+            .unwrap();
+        let script = job
+            .as_mapping()
+            .unwrap()
+            .get(&serde_yaml::Value::String("script".to_string()))
+            .unwrap();
+        assert!(is_path_array(script, &["job", "script"]));
     }
 }
