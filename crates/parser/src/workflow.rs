@@ -354,6 +354,18 @@ pub fn parse_workflow(path: &Path) -> Result<WorkflowDefinition, String> {
     let validator = SchemaValidator::new()?;
     validator.validate_workflow(path)?;
 
+    // For GitLab CI files, use the dedicated GitLab parser and convert the
+    // result to WorkflowDefinition so the TUI can display jobs, stages, etc.
+    let is_gitlab = path.file_name().is_some_and(|name| {
+        let name_str = name.to_string_lossy();
+        name_str.ends_with(".gitlab-ci.yml") || name_str.ends_with(".gitlab-ci.yaml")
+    });
+    if is_gitlab {
+        let pipeline = super::gitlab::parse_pipeline(path)
+            .map_err(|e| format!("Failed to parse GitLab CI pipeline: {}", e))?;
+        return Ok(super::gitlab::convert_to_workflow_format(&pipeline));
+    }
+
     // If validation passes, parse the workflow
     let content =
         fs::read_to_string(path).map_err(|e| format!("Failed to read workflow file: {}", e))?;
