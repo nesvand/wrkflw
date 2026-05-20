@@ -340,6 +340,9 @@ pub mod gitlab {
             #[serde(skip_serializing_if = "Option::is_none")]
             variables: Option<HashMap<String, String>>,
         },
+        /// Raw value for unresolved or non-standard rules
+        /// (e.g., path arrays from unresolvable !reference tags)
+        Raw(serde_yaml::Value),
     }
 
     /// Only/except configuration

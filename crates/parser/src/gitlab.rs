@@ -304,31 +304,66 @@ build:
         let rules = build_job.rules.as_ref().unwrap();
         assert_eq!(rules.len(), 2);
 
-        match &rules[0] {
-            wrkflw_models::gitlab::Rule::Structured {
-                if_,
-                when,
-                variables,
-            } => {
-                assert_eq!(if_.as_deref(), Some("$CI_COMMIT_BRANCH == \"main\""));
-                assert_eq!(when.as_deref(), Some("always"));
-                assert!(variables.is_none());
-            }
+        if let wrkflw_models::gitlab::Rule::Structured {
+            if_,
+            when,
+            variables,
+        } = &rules[0]
+        {
+            assert_eq!(if_.as_deref(), Some("$CI_COMMIT_BRANCH == \"main\""));
+            assert_eq!(when.as_deref(), Some("always"));
+            assert!(variables.is_none());
+        } else {
+            panic!("Expected Rule::Structured for rules[0]");
         }
 
-        match &rules[1] {
-            wrkflw_models::gitlab::Rule::Structured {
-                if_,
-                when,
-                variables,
-            } => {
-                assert_eq!(
-                    if_.as_deref(),
-                    Some("$CI_PIPELINE_SOURCE == \"merge_request_event\"")
-                );
-                assert_eq!(when.as_deref(), Some("manual"));
-                assert!(variables.is_none());
+        if let wrkflw_models::gitlab::Rule::Structured {
+            if_,
+            when,
+            variables,
+        } = &rules[1]
+        {
+            assert_eq!(
+                if_.as_deref(),
+                Some("$CI_PIPELINE_SOURCE == \"merge_request_event\"")
+            );
+            assert_eq!(when.as_deref(), Some("manual"));
+            assert!(variables.is_none());
+        } else {
+            panic!("Expected Rule::Structured for rules[1]");
+        }
+    }
+
+    #[test]
+    fn test_parse_pipeline_with_external_references() {
+        let file = NamedTempFile::new().unwrap();
+        let content = r#"
+stages:
+  - build
+
+build:
+  stage: build
+  script:
+    - echo "Building..."
+  rules:
+    - !reference [.rules, except_config]
+"#;
+        fs::write(&file, content).unwrap();
+
+        let pipeline = parse_pipeline(file.path()).unwrap();
+
+        let build_job = pipeline.jobs.get("build").unwrap();
+        let rules = build_job.rules.as_ref().unwrap();
+        assert_eq!(rules.len(), 1);
+
+        match &rules[0] {
+            wrkflw_models::gitlab::Rule::Raw(value) => {
+                let seq = value.as_sequence().unwrap();
+                assert_eq!(seq.len(), 2);
+                assert_eq!(seq[0].as_str().unwrap(), ".rules");
+                assert_eq!(seq[1].as_str().unwrap(), "except_config");
             }
+            _ => panic!("Expected Rule::Raw for unresolved reference"),
         }
     }
 }

@@ -53,15 +53,18 @@ fn resolve_reference_tag(
 ) -> serde_yaml::Value {
     let path = match extract_path(&tagged.value) {
         Some(p) => p,
+        // Malformed tag (not a sequence) → leave as-is (don't crash)
         None => return serde_yaml::Value::Tagged(Box::new(tagged.clone())),
     };
 
     if path.is_empty() {
+        // Empty path → leave as-is
         return serde_yaml::Value::Tagged(Box::new(tagged.clone()));
     }
 
     if chain.contains(&path) {
-        return serde_yaml::Value::Tagged(Box::new(tagged.clone()));
+        // Cycle detected → leave unresolved (replace with path array)
+        return tagged.value.clone();
     }
 
     chain.insert(path.clone());
@@ -71,7 +74,8 @@ fn resolve_reference_tag(
     // Must keep path in chain during transitive resolution so cycles are detected
     let output = match result {
         Some(resolved) => resolve_node(resolved, root, chain),
-        None => serde_yaml::Value::Tagged(Box::new(tagged.clone())),
+        // Target not found → replace with inner path array for downstream
+        None => tagged.value.clone(),
     };
 
     chain.remove(&path);
@@ -122,6 +126,19 @@ mod tests {
 
     fn is_tagged(v: &serde_yaml::Value) -> bool {
         matches!(v, serde_yaml::Value::Tagged(_))
+    }
+
+    fn is_path_array(v: &serde_yaml::Value, expected: &[&str]) -> bool {
+        match v {
+            serde_yaml::Value::Sequence(seq) => {
+                seq.len() == expected.len()
+                    && seq.iter().zip(expected).all(|(a, b)| match a {
+                        serde_yaml::Value::String(s) => s == b,
+                        _ => false,
+                    })
+            }
+            _ => false,
+        }
     }
 
     #[test]
@@ -230,7 +247,7 @@ build:
             .unwrap()
             .as_sequence()
             .unwrap();
-        assert!(is_tagged(&rules[0]));
+        assert!(is_path_array(&rules[0], &[".nonexistent", "rules"]));
     }
 
     #[test]
@@ -258,7 +275,7 @@ job_b:
             .unwrap()
             .get(&serde_yaml::Value::String("script".to_string()))
             .unwrap();
-        assert!(is_tagged(script_a));
+        assert!(is_path_array(script_a, &["job_b", "script"]));
 
         let job_b = resolved
             .as_mapping()
@@ -270,7 +287,7 @@ job_b:
             .unwrap()
             .get(&serde_yaml::Value::String("script".to_string()))
             .unwrap();
-        assert!(is_tagged(script_b));
+        assert!(is_path_array(script_b, &["job_a", "script"]));
     }
 
     #[test]

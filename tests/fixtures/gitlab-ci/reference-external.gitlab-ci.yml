@@ -1,0 +1,8 @@
+# Uses !reference to an undefined target (simulates external reference)
+# .rules is not defined in this file, so the resolver falls back to path array
+build:
+  stage: build
+  script:
+    - echo "Building..."
+  rules:
+    - !reference [.rules, except_config]
