@@ -350,12 +350,10 @@ pub struct ActionInfo {
 }
 
 pub fn parse_workflow(path: &Path) -> Result<WorkflowDefinition, String> {
-    // First validate against schema
-    let validator = SchemaValidator::new()?;
-    validator.validate_workflow(path)?;
-
-    // For GitLab CI files, use the dedicated GitLab parser and convert the
-    // result to WorkflowDefinition so the TUI can display jobs, stages, etc.
+    // For GitLab CI files, use the dedicated GitLab parser which handles
+    // include resolution, !reference tags, schema validation, and structural
+    // validation. Convert the result to WorkflowDefinition so the TUI can
+    // display jobs, stages, etc.
     let is_gitlab = path.file_name().is_some_and(|name| {
         let name_str = name.to_string_lossy();
         name_str.ends_with(".gitlab-ci.yml") || name_str.ends_with(".gitlab-ci.yaml")
@@ -365,6 +363,10 @@ pub fn parse_workflow(path: &Path) -> Result<WorkflowDefinition, String> {
             .map_err(|e| format!("Failed to parse GitLab CI pipeline: {}", e))?;
         return Ok(super::gitlab::convert_to_workflow_format(&pipeline));
     }
+
+    // First validate against schema
+    let validator = SchemaValidator::new()?;
+    validator.validate_workflow(path)?;
 
     // If validation passes, parse the workflow
     let content =
