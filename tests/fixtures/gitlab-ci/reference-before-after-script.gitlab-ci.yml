@@ -1,0 +1,14 @@
+.templates:
+  before_script:
+    - export VAR=hello
+    - echo "Starting job"
+  after_script:
+    - echo "Cleanup"
+    - rm -rf temp
+
+build:
+  stage: build
+  script:
+    - echo "Building..."
+  before_script: !reference [.templates, before_script]
+  after_script: !reference [.templates, after_script]

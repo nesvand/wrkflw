@@ -1,0 +1,12 @@
+.scripts:
+  script:
+    - echo "build step 1"
+    - echo "build step 2"
+
+build:
+  stage: build
+  script: !reference [.scripts, script]
+
+test:
+  stage: test
+  script: !reference [.nonexistent, script]

@@ -366,4 +366,142 @@ build:
             _ => panic!("Expected Rule::Raw for unresolved reference"),
         }
     }
+
+    #[test]
+    fn test_parse_pipeline_reference_in_script() {
+        let file = NamedTempFile::new().unwrap();
+        let content = r#"
+.scripts:
+  script:
+    - echo "build step 1"
+    - echo "build step 2"
+
+build:
+  stage: build
+  script: !reference [.scripts, script]
+
+test:
+  stage: test
+  script: !reference [.nonexistent, script]
+"#;
+        fs::write(&file, content).unwrap();
+
+        let pipeline = parse_pipeline(file.path()).unwrap();
+
+        // Resolved reference: script should contain the referenced commands
+        let build_job = pipeline.jobs.get("build").unwrap();
+        let build_script = build_job.script.as_ref().unwrap();
+        assert_eq!(build_script.len(), 2);
+        assert_eq!(build_script[0], "echo \"build step 1\"");
+        assert_eq!(build_script[1], "echo \"build step 2\"");
+
+        // Unresolved reference: script should contain the path array
+        let test_job = pipeline.jobs.get("test").unwrap();
+        let test_script = test_job.script.as_ref().unwrap();
+        assert_eq!(test_script.len(), 2);
+        assert_eq!(test_script[0], ".nonexistent");
+        assert_eq!(test_script[1], "script");
+    }
+
+    #[test]
+    fn test_parse_pipeline_reference_in_before_after_script() {
+        let file = NamedTempFile::new().unwrap();
+        let content = r#"
+.templates:
+  before_script:
+    - export VAR=hello
+  after_script:
+    - echo "Cleanup"
+
+build:
+  stage: build
+  script:
+    - echo "Building..."
+  before_script: !reference [.templates, before_script]
+  after_script: !reference [.templates, after_script]
+"#;
+        fs::write(&file, content).unwrap();
+
+        let pipeline = parse_pipeline(file.path()).unwrap();
+
+        let build_job = pipeline.jobs.get("build").unwrap();
+
+        let before_script = build_job.before_script.as_ref().unwrap();
+        assert_eq!(before_script.len(), 1);
+        assert_eq!(before_script[0], "export VAR=hello");
+
+        let after_script = build_job.after_script.as_ref().unwrap();
+        assert_eq!(after_script.len(), 1);
+        assert_eq!(after_script[0], "echo \"Cleanup\"");
+    }
+
+    #[test]
+    fn test_parse_pipeline_reference_in_extends() {
+        let file = NamedTempFile::new().unwrap();
+        let content = r#"
+.templates:
+  extends:
+    - .base-job
+    - .default-job
+
+stages:
+  - build
+
+build:
+  stage: build
+  script:
+    - echo "Building..."
+  extends: !reference [.templates, extends]
+"#;
+        fs::write(&file, content).unwrap();
+
+        let pipeline = parse_pipeline(file.path()).unwrap();
+
+        let build_job = pipeline.jobs.get("build").unwrap();
+        let extends = build_job.extends.as_ref().unwrap();
+        assert_eq!(extends.len(), 2);
+        assert_eq!(extends[0], ".base-job");
+        assert_eq!(extends[1], ".default-job");
+    }
+
+    #[test]
+    fn test_parse_pipeline_reference_in_dependencies() {
+        let file = NamedTempFile::new().unwrap();
+        let content = r#"
+.deps:
+  dependencies:
+    - build
+    - test
+
+stages:
+  - build
+  - test
+  - deploy
+
+build:
+  stage: build
+  script:
+    - echo "Building..."
+
+test:
+  stage: test
+  script:
+    - echo "Testing..."
+
+deploy:
+  stage: deploy
+  script:
+    - echo "Deploying..."
+  dependencies: !reference [.deps, dependencies]
+"#;
+        fs::write(&file, content).unwrap();
+
+        let pipeline = parse_pipeline(file.path()).unwrap();
+
+        let deploy_job = pipeline.jobs.get("deploy").unwrap();
+        let dependencies = deploy_job.dependencies.as_ref().unwrap();
+        assert_eq!(dependencies.len(), 2);
+        assert_eq!(dependencies[0], "build");
+        assert_eq!(dependencies[1], "test");
+    }
 }

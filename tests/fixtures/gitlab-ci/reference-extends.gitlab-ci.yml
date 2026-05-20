@@ -1,0 +1,13 @@
+.templates:
+  extends:
+    - .base-job
+    - .default-job
+
+stages:
+  - build
+
+build:
+  stage: build
+  script:
+    - echo "Building..."
+  extends: !reference [.templates, extends]
