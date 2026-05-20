@@ -1,0 +1,7 @@
+# Uses extends: !reference to an undeclared target (simulates external template)
+# The pre-scan should detect the !reference tag and skip the extends-undefined check
+build:
+  stage: build
+  script:
+    - echo "Building..."
+  extends: !reference [.templates, build_job]

@@ -1,7 +1,7 @@
 use crate::reference_resolver;
 use crate::schema::{SchemaType, SchemaValidator};
 use crate::workflow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use thiserror::Error;
@@ -32,6 +32,12 @@ pub fn parse_pipeline(pipeline_path: &Path) -> Result<Pipeline, GitlabParserErro
     let raw_yaml: serde_yaml::Value =
         serde_yaml::from_str(&pipeline_content).map_err(GitlabParserError::from)?;
 
+    // Pre-scan for jobs with !reference in extends before resolution.
+    // These will have their extends field replaced with a path array after
+    // resolution, so the structural validator must skip the "extends undefined"
+    // check for them.
+    let tagged_extends_jobs = scan_tagged_extends(&raw_yaml);
+
     // Resolve !reference tags
     let resolved_yaml = reference_resolver::resolve_references(&raw_yaml);
 
@@ -50,12 +56,78 @@ pub fn parse_pipeline(pipeline_path: &Path) -> Result<Pipeline, GitlabParserErro
     // Deserialize resolved YAML into Pipeline struct
     let pipeline: Pipeline = serde_yaml::from_value(resolved_yaml)?;
 
-    // Return the parsed pipeline
+    // Structural validation (skipping extends check for jobs with tagged extends)
+    let validation_result = validate_pipeline_structure(&pipeline, &tagged_extends_jobs);
+    if !validation_result.is_valid {
+        return Err(GitlabParserError::InvalidStructure(
+            validation_result.issues.join("; "),
+        ));
+    }
+
     Ok(pipeline)
 }
 
+/// Scan raw YAML for jobs whose `extends` field contains a `!reference` tag.
+///
+/// These jobs will have their extends replaced by a path array after
+/// resolution, so downstream validators must skip "extends undefined"
+/// checks for them.
+fn scan_tagged_extends(raw: &serde_yaml::Value) -> HashSet<String> {
+    let mut result = HashSet::new();
+
+    let root_map = match raw.as_mapping() {
+        Some(m) => m,
+        None => return result,
+    };
+
+    for (key, value) in root_map {
+        let job_name = match key.as_str() {
+            Some(s) => s,
+            None => continue,
+        };
+
+        // Skip hidden jobs (template anchors)
+        if job_name.starts_with('.') {
+            continue;
+        }
+
+        let job_map = match value.as_mapping() {
+            Some(m) => m,
+            None => continue,
+        };
+
+        let extends_key = serde_yaml::Value::String("extends".to_string());
+        let extends_val = match job_map.get(&extends_key) {
+            Some(v) => v,
+            None => continue,
+        };
+
+        if has_tagged_reference(extends_val) {
+            result.insert(job_name.to_string());
+        }
+    }
+
+    result
+}
+
+/// Check if a value (or any element in a sequence) is a `!reference` tag.
+fn has_tagged_reference(val: &serde_yaml::Value) -> bool {
+    match val {
+        serde_yaml::Value::Tagged(tagged) => tagged.tag == "!reference",
+        serde_yaml::Value::Sequence(seq) => seq.iter().any(has_tagged_reference),
+        _ => false,
+    }
+}
+
 /// Validate the basic structure of a GitLab CI/CD pipeline
-pub fn validate_pipeline_structure(pipeline: &Pipeline) -> ValidationResult {
+///
+/// `tagged_extends_jobs` — set of job names whose `extends` field contained a
+/// `!reference` tag before resolution. The extends check is skipped for these
+/// jobs since their extends value is a path array, not a job name.
+pub fn validate_pipeline_structure(
+    pipeline: &Pipeline,
+    tagged_extends_jobs: &HashSet<String>,
+) -> ValidationResult {
     let mut result = ValidationResult::new();
 
     // Check for at least one job
@@ -65,8 +137,8 @@ pub fn validate_pipeline_structure(pipeline: &Pipeline) -> ValidationResult {
 
     // Check for script in jobs
     for (job_name, job) in &pipeline.jobs {
-        // Skip template jobs
-        if let Some(true) = job.template {
+        // Skip template and hidden jobs
+        if job_name.starts_with('.') || job.template == Some(true) {
             continue;
         }
 
@@ -82,6 +154,9 @@ pub fn validate_pipeline_structure(pipeline: &Pipeline) -> ValidationResult {
     // Check that referenced stages are defined
     if let Some(stages) = &pipeline.stages {
         for (job_name, job) in &pipeline.jobs {
+            if job_name.starts_with('.') {
+                continue;
+            }
             if let Some(stage) = &job.stage {
                 if !stages.contains(stage) {
                     result.add_issue(format!(
@@ -95,6 +170,9 @@ pub fn validate_pipeline_structure(pipeline: &Pipeline) -> ValidationResult {
 
     // Check that job dependencies exist
     for (job_name, job) in &pipeline.jobs {
+        if job_name.starts_with('.') {
+            continue;
+        }
         if let Some(dependencies) = &job.dependencies {
             for dependency in dependencies {
                 if !pipeline.jobs.contains_key(dependency) {
@@ -108,7 +186,11 @@ pub fn validate_pipeline_structure(pipeline: &Pipeline) -> ValidationResult {
     }
 
     // Check that job extensions exist
+    // Skip hidden jobs and jobs whose extends contained a !reference tag
     for (job_name, job) in &pipeline.jobs {
+        if job_name.starts_with('.') || tagged_extends_jobs.contains(job_name.as_str()) {
+            continue;
+        }
         if let Some(extends) = &job.extends {
             for extend in extends {
                 if !pipeline.jobs.contains_key(extend) {
@@ -503,5 +585,56 @@ deploy:
         assert_eq!(dependencies.len(), 2);
         assert_eq!(dependencies[0], "build");
         assert_eq!(dependencies[1], "test");
+    }
+
+    #[test]
+    fn test_parse_pipeline_extends_reference_undeclared_target() {
+        // extends: !reference to an undeclared target should NOT produce
+        // a false "extends undefined job" validation error
+        let file = NamedTempFile::new().unwrap();
+        let content = r#"
+stages:
+  - build
+
+build:
+  stage: build
+  script:
+    - echo "Building..."
+  extends: !reference [.templates, build_job]
+"#;
+        fs::write(&file, content).unwrap();
+
+        // Should parse without InvalidStructure error for extends
+        let pipeline = parse_pipeline(file.path()).unwrap();
+
+        let build_job = pipeline.jobs.get("build").unwrap();
+        let extends = build_job.extends.as_ref().unwrap();
+        assert_eq!(extends.len(), 2);
+        assert_eq!(extends[0], ".templates");
+        assert_eq!(extends[1], "build_job");
+    }
+
+    #[test]
+    fn test_validate_regular_extends_still_validates() {
+        // Regular extends: job_name (untagged) should still fail validation
+        // when the target doesn't exist
+        let file = NamedTempFile::new().unwrap();
+        let content = r#"
+stages:
+  - build
+
+build:
+  stage: build
+  script:
+    - echo "Building..."
+  extends: nonexistent_job
+"#;
+        fs::write(&file, content).unwrap();
+
+        let result = parse_pipeline(file.path());
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("extends undefined"));
+        assert!(err.contains("nonexistent_job"));
     }
 }
