@@ -36,10 +36,21 @@ fn resolve_node(
         }
         serde_yaml::Value::Sequence(seq) => {
             let next_depth = depth + 1;
-            let resolved: Vec<serde_yaml::Value> = seq
-                .iter()
-                .map(|item| resolve_node(item, root, chain, next_depth))
-                .collect();
+            let mut resolved = Vec::new();
+            for item in seq {
+                let was_reference = matches!(item, serde_yaml::Value::Tagged(t) if t.tag == "!reference");
+                let resolved_item = resolve_node(item, root, chain, next_depth);
+                if was_reference {
+                    // GitLab flattens !reference results into the parent sequence
+                    if let serde_yaml::Value::Sequence(inner) = resolved_item {
+                        resolved.extend(inner);
+                    } else {
+                        resolved.push(resolved_item);
+                    }
+                } else {
+                    resolved.push(resolved_item);
+                }
+            }
             serde_yaml::Value::Sequence(resolved)
         }
         serde_yaml::Value::Mapping(map) => {
@@ -240,6 +251,8 @@ build:
 
     #[test]
     fn test_resolve_missing_target_graceful() {
+        // When a !reference can't be resolved, the path array is flattened
+        // into the parent sequence (matching GitLab's inline behavior).
         let yaml = serde_yaml::from_str::<serde_yaml::Value>(
             r#"
 build:
@@ -264,7 +277,9 @@ build:
             .unwrap()
             .as_sequence()
             .unwrap();
-        assert!(is_path_array(&rules[0], &[".nonexistent", "rules"]));
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0].as_str().unwrap(), ".nonexistent");
+        assert_eq!(rules[1].as_str().unwrap(), "rules");
     }
 
     #[test]

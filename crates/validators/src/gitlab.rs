@@ -15,15 +15,23 @@ pub fn validate_gitlab_pipeline(pipeline: &Pipeline) -> ValidationResult {
     validate_jobs(&pipeline.jobs, &mut result);
 
     // Validate stages if defined
+    // Unused stage check is skipped when unresolved includes exist, since
+    // stages may be used by jobs defined in unresolvable includes.
     if let Some(stages) = &pipeline.stages {
-        validate_stages(stages, &pipeline.jobs, &mut result);
+        validate_stages(stages, &pipeline.jobs, pipeline.has_unresolved_includes, &mut result);
     }
 
-    // Validate dependencies
-    validate_dependencies(&pipeline.jobs, &mut result);
+    // Validate dependencies (skipped when unresolved includes exist, since
+    // dependencies may reference jobs defined in unresolvable includes)
+    if !pipeline.has_unresolved_includes {
+        validate_dependencies(&pipeline.jobs, &mut result);
+    }
 
-    // Validate extends
-    validate_extends(&pipeline.jobs, &mut result);
+    // Validate extends (skipped when unresolved includes exist, since
+    // extends may reference templates defined in unresolvable includes)
+    if !pipeline.has_unresolved_includes {
+        validate_extends(&pipeline.jobs, &mut result);
+    }
 
     // Validate artifacts
     validate_artifacts(&pipeline.jobs, &mut result);
@@ -34,15 +42,15 @@ pub fn validate_gitlab_pipeline(pipeline: &Pipeline) -> ValidationResult {
 /// Validate GitLab CI/CD jobs
 fn validate_jobs(jobs: &HashMap<String, Job>, result: &mut ValidationResult) {
     for (job_name, job) in jobs {
-        // Skip template jobs
-        if let Some(true) = job.template {
+        // Skip hidden template jobs (dot-prefixed)
+        if job_name.starts_with('.') || job.template == Some(true) {
             continue;
         }
 
-        // Check for script or extends
-        if job.script.is_none() && job.extends.is_none() {
+        // Check for script, extends, or trigger
+        if job.script.is_none() && job.extends.is_none() && job.trigger.is_none() {
             result.add_issue(format!(
-                "Job '{}' must have a script section or extend another job",
+                "Job '{}' must have a script section, extend another job, or define a trigger",
                 job_name
             ));
         }
@@ -87,10 +95,20 @@ fn validate_jobs(jobs: &HashMap<String, Job>, result: &mut ValidationResult) {
 }
 
 /// Validate GitLab CI/CD stages
-fn validate_stages(stages: &[String], jobs: &HashMap<String, Job>, result: &mut ValidationResult) {
+fn validate_stages(
+    stages: &[String],
+    jobs: &HashMap<String, Job>,
+    has_unresolved_includes: bool,
+    result: &mut ValidationResult,
+) {
     // Check that all jobs reference existing stages
     for (job_name, job) in jobs {
         if let Some(stage) = &job.stage {
+            // .pre and .post are built-in GitLab CI stages that don't
+            // need to be declared in the stages list
+            if stage == ".pre" || stage == ".post" {
+                continue;
+            }
             if !stages.contains(stage) {
                 result.add_issue(format!(
                     "Job '{}' references undefined stage '{}'. Available stages are: {}",
@@ -102,21 +120,24 @@ fn validate_stages(stages: &[String], jobs: &HashMap<String, Job>, result: &mut 
         }
     }
 
-    // Check for unused stages
-    for stage in stages {
-        let used = jobs.values().any(|job| {
-            if let Some(job_stage) = &job.stage {
-                job_stage == stage
-            } else {
-                false
-            }
-        });
+    // Check for unused stages (skipped when unresolved includes exist, since
+    // stages may be used by jobs defined in unresolvable includes)
+    if !has_unresolved_includes {
+        for stage in stages {
+            let used = jobs.values().any(|job| {
+                if let Some(job_stage) = &job.stage {
+                    job_stage == stage
+                } else {
+                    false
+                }
+            });
 
-        if !used {
-            result.add_issue(format!(
-                "Stage '{}' is defined but not used by any job",
-                stage
-            ));
+            if !used {
+                result.add_issue(format!(
+                    "Stage '{}' is defined but not used by any job",
+                    stage
+                ));
+            }
         }
     }
 }

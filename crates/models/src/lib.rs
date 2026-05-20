@@ -36,13 +36,31 @@ pub mod gitlab {
         #[serde(untagged)]
         enum StringOrVec {
             String(String),
-            Vec(Vec<String>),
+            Vec(Vec<serde_yaml::Value>),
         }
         let value = Option::<StringOrVec>::deserialize(deserializer)?;
         match value {
             Some(StringOrVec::String(s)) => Ok(Some(vec![s])),
-            Some(StringOrVec::Vec(v)) => Ok(Some(v)),
+            Some(StringOrVec::Vec(v)) => {
+                let mut result = Vec::new();
+                for item in v {
+                    flatten_yaml_strings(&item, &mut result);
+                }
+                Ok(Some(result))
+            }
             None => Ok(None),
+        }
+    }
+
+    fn flatten_yaml_strings(value: &serde_yaml::Value, result: &mut Vec<String>) {
+        match value {
+            serde_yaml::Value::String(s) => result.push(s.clone()),
+            serde_yaml::Value::Sequence(seq) => {
+                for item in seq {
+                    flatten_yaml_strings(item, result);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -118,10 +136,18 @@ pub mod gitlab {
         #[serde(skip_serializing_if = "Option::is_none")]
         pub workflow: Option<Workflow>,
 
-        /// Includes for pipeline configuration
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub include: Option<Vec<Include>>,
-    }
+    /// Includes for pipeline configuration
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub include: Option<Vec<Include>>,
+
+    /// Whether the pipeline has include directives that could not be resolved
+    /// locally (e.g., project, remote, template, component, or artifact includes).
+    /// When true, the structural validator skips "extends undefined" and
+    /// "depends on undefined" checks, since those jobs may come from unresolved
+    /// includes.
+    #[serde(skip)]
+    pub has_unresolved_includes: bool,
+}
 
     /// A job in a GitLab CI/CD pipeline
     #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -214,9 +240,9 @@ pub mod gitlab {
         #[serde(skip_serializing_if = "Option::is_none")]
         pub timeout: Option<String>,
 
-        /// Mark job as parallel and specify instance count
+        /// Mark job as parallel (count or matrix)
         #[serde(skip_serializing_if = "Option::is_none")]
-        pub parallel: Option<usize>,
+        pub parallel: Option<Parallel>,
 
         /// Flag to indicate this is a template job
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -237,6 +263,10 @@ pub mod gitlab {
         /// Whether the job can be interrupted by a newer pipeline
         #[serde(skip_serializing_if = "Option::is_none")]
         pub interruptible: Option<bool>,
+
+        /// Trigger configuration for downstream pipelines
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub trigger: Option<serde_yaml::Value>,
     }
 
     /// Docker image configuration
@@ -420,6 +450,19 @@ pub mod gitlab {
         },
     }
 
+    /// Parallel configuration (count or matrix)
+    #[derive(Debug, Serialize, Deserialize, Clone)]
+    #[serde(untagged)]
+    pub enum Parallel {
+        /// Simple parallel count
+        Count(usize),
+        /// Matrix parallel configuration
+        Matrix {
+            /// Matrix axes
+            matrix: Vec<HashMap<String, Vec<String>>>,
+        },
+    }
+
     /// Include configuration for external pipeline files
     #[derive(Debug, Serialize, Deserialize, Clone)]
     #[serde(untagged)]
@@ -437,15 +480,28 @@ pub mod gitlab {
             /// Include from project
             #[serde(skip_serializing_if = "Option::is_none")]
             project: Option<String>,
-            /// Include specific file from project
-            #[serde(skip_serializing_if = "Option::is_none")]
-            file: Option<String>,
+            /// Include specific file(s) from project
+            #[serde(
+                default,
+                skip_serializing_if = "Option::is_none",
+                deserialize_with = "deserialize_string_or_vec"
+            )]
+            file: Option<Vec<String>>,
             /// Include template
             #[serde(skip_serializing_if = "Option::is_none")]
             template: Option<String>,
-            /// Ref to use when including from project
+            /// Include artifact path
             #[serde(skip_serializing_if = "Option::is_none")]
+            artifact: Option<String>,
+            /// Job that produced the artifact
+            #[serde(skip_serializing_if = "Option::is_none")]
+            job: Option<String>,
+            /// Ref to use when including from project or artifact
+            #[serde(rename = "ref", skip_serializing_if = "Option::is_none")]
             ref_: Option<String>,
+            /// Rules for conditional includes
+            #[serde(skip_serializing_if = "Option::is_none")]
+            rules: Option<Vec<Rule>>,
         },
     }
 }

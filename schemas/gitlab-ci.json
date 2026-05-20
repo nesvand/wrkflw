@@ -1266,7 +1266,7 @@
     },
     "globalVariables": {
       "markdownDescription": "Defines default variables for all jobs. Job level property overrides global variables. [Learn More](https://docs.gitlab.com/ee/ci/yaml/#variables).",
-      "type": "object",
+      "type": ["object", "null"],
       "patternProperties": {
         ".*": {
           "oneOf": [
@@ -1310,7 +1310,7 @@
     },
     "jobVariables": {
       "markdownDescription": "Defines variables for a job. [Learn More](https://docs.gitlab.com/ee/ci/yaml/#variables).",
-      "type": "object",
+      "type": ["object", "null"],
       "patternProperties": {
         ".*": {
           "oneOf": [

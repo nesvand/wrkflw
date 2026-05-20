@@ -1,3 +1,4 @@
+use crate::include_resolver;
 use crate::reference_resolver;
 use crate::schema::{SchemaType, SchemaValidator};
 use crate::workflow;
@@ -7,6 +8,13 @@ use std::path::Path;
 use thiserror::Error;
 use wrkflw_models::gitlab::Pipeline;
 use wrkflw_models::ValidationResult;
+
+/// Root-level keys that belong to Pipeline (not jobs).
+/// Everything else is treated as a job via `#[serde(flatten)]`.
+const PIPELINE_FIELDS: &[&str] = &[
+    "image", "variables", "stages", "before_script", "after_script",
+    "default", "workflow", "include",
+];
 
 #[derive(Error, Debug)]
 pub enum GitlabParserError {
@@ -32,14 +40,21 @@ pub fn parse_pipeline(pipeline_path: &Path) -> Result<Pipeline, GitlabParserErro
     let raw_yaml: serde_yaml::Value =
         serde_yaml::from_str(&pipeline_content).map_err(GitlabParserError::from)?;
 
+    // Resolve local include directives before any other processing.
+    // This merges jobs/templates from included files into the root document,
+    // so that !reference resolution and structural validation can find them.
+    let resolved = include_resolver::resolve_includes(&raw_yaml, pipeline_path);
+
     // Pre-scan for jobs with !reference in extends before resolution.
     // These will have their extends field replaced with a path array after
     // resolution, so the structural validator must skip the "extends undefined"
     // check for them.
-    let tagged_extends_jobs = scan_tagged_extends(&raw_yaml);
+    // Run this on the merged document so includes are considered.
+    let tagged_extends_jobs = scan_tagged_extends(&resolved.merged_yaml);
 
-    // Resolve !reference tags
-    let resolved_yaml = reference_resolver::resolve_references(&raw_yaml);
+    // Resolve !reference tags on the merged document
+    // (includes may contain templates referenced by !reference tags)
+    let resolved_yaml = reference_resolver::resolve_references(&resolved.merged_yaml);
 
     // Convert resolved YAML to JSON for schema validation
     let json_value: serde_json::Value = serde_json::to_value(&resolved_yaml).map_err(|e| {
@@ -54,10 +69,24 @@ pub fn parse_pipeline(pipeline_path: &Path) -> Result<Pipeline, GitlabParserErro
         .map_err(GitlabParserError::SchemaValidationError)?;
 
     // Deserialize resolved YAML into Pipeline struct
-    let pipeline: Pipeline = serde_yaml::from_value(resolved_yaml)?;
+    // Filter root-level values: `#[serde(flatten)]` on jobs means every root key
+    // not declared on Pipeline is tried as a Job. Non-mapping values (e.g., YAML
+    // anchors like `.npm_config_setup` which is an array) would fail as Job
+    // struct deserialization, so we strip them before passing to serde.
+    let filtered_yaml = filter_root_for_deserialization(&resolved_yaml);
+    let mut pipeline: Pipeline = serde_yaml::from_value(filtered_yaml)?;
+    pipeline.has_unresolved_includes = resolved.has_unresolved_includes;
+    let mut validation_result =
+        validate_pipeline_structure(&pipeline, &tagged_extends_jobs, resolved.has_unresolved_includes);
 
-    // Structural validation (skipping extends check for jobs with tagged extends)
-    let validation_result = validate_pipeline_structure(&pipeline, &tagged_extends_jobs);
+    // Report failed local includes as validation issues
+    for path in &resolved.failed_local_includes {
+        validation_result.add_issue(format!(
+            "Failed to resolve local include '{}': file not found or invalid",
+            path
+        ));
+    }
+
     if !validation_result.is_valid {
         return Err(GitlabParserError::InvalidStructure(
             validation_result.issues.join("; "),
@@ -124,9 +153,15 @@ fn has_tagged_reference(val: &serde_yaml::Value) -> bool {
 /// `tagged_extends_jobs` — set of job names whose `extends` field contained a
 /// `!reference` tag before resolution. The extends check is skipped for these
 /// jobs since their extends value is a path array, not a job name.
+///
+/// `has_unresolved_includes` — when true, "extends undefined" and "depends on
+/// undefined" checks are skipped because those jobs may be defined in includes
+/// that couldn't be resolved locally (e.g., project, remote, or template
+/// includes).
 pub fn validate_pipeline_structure(
     pipeline: &Pipeline,
     tagged_extends_jobs: &HashSet<String>,
+    has_unresolved_includes: bool,
 ) -> ValidationResult {
     let mut result = ValidationResult::new();
 
@@ -142,10 +177,10 @@ pub fn validate_pipeline_structure(
             continue;
         }
 
-        // Check for script or extends
-        if job.script.is_none() && job.extends.is_none() {
+        // Check for script, extends, or trigger
+        if job.script.is_none() && job.extends.is_none() && job.trigger.is_none() {
             result.add_issue(format!(
-                "Job '{}' must have a script section or extend another job",
+                "Job '{}' must have a script section, extend another job, or define a trigger",
                 job_name
             ));
         }
@@ -158,6 +193,11 @@ pub fn validate_pipeline_structure(
                 continue;
             }
             if let Some(stage) = &job.stage {
+                // .pre and .post are built-in GitLab CI stages that don't
+                // need to be declared in the stages list
+                if stage == ".pre" || stage == ".post" {
+                    continue;
+                }
                 if !stages.contains(stage) {
                     result.add_issue(format!(
                         "Job '{}' references undefined stage '{}'",
@@ -169,17 +209,21 @@ pub fn validate_pipeline_structure(
     }
 
     // Check that job dependencies exist
-    for (job_name, job) in &pipeline.jobs {
-        if job_name.starts_with('.') {
-            continue;
-        }
-        if let Some(dependencies) = &job.dependencies {
-            for dependency in dependencies {
-                if !pipeline.jobs.contains_key(dependency) {
-                    result.add_issue(format!(
-                        "Job '{}' depends on undefined job '{}'",
-                        job_name, dependency
-                    ));
+    // Skipped when there are unresolved includes, since the dependency may be
+    // defined in an unresolvable project/remote/template include.
+    if !has_unresolved_includes {
+        for (job_name, job) in &pipeline.jobs {
+            if job_name.starts_with('.') {
+                continue;
+            }
+            if let Some(dependencies) = &job.dependencies {
+                for dependency in dependencies {
+                    if !pipeline.jobs.contains_key(dependency) {
+                        result.add_issue(format!(
+                            "Job '{}' depends on undefined job '{}'",
+                            job_name, dependency
+                        ));
+                    }
                 }
             }
         }
@@ -187,17 +231,21 @@ pub fn validate_pipeline_structure(
 
     // Check that job extensions exist
     // Skip hidden jobs and jobs whose extends contained a !reference tag
-    for (job_name, job) in &pipeline.jobs {
-        if job_name.starts_with('.') || tagged_extends_jobs.contains(job_name.as_str()) {
-            continue;
-        }
-        if let Some(extends) = &job.extends {
-            for extend in extends {
-                if !pipeline.jobs.contains_key(extend) {
-                    result.add_issue(format!(
-                        "Job '{}' extends undefined job '{}'",
-                        job_name, extend
-                    ));
+    // Skipped entirely when there are unresolved includes, since the extension
+    // target may be defined in an unresolvable include.
+    if !has_unresolved_includes {
+        for (job_name, job) in &pipeline.jobs {
+            if job_name.starts_with('.') || tagged_extends_jobs.contains(job_name.as_str()) {
+                continue;
+            }
+            if let Some(extends) = &job.extends {
+                for extend in extends {
+                    if !pipeline.jobs.contains_key(extend) {
+                        result.add_issue(format!(
+                            "Job '{}' extends undefined job '{}'",
+                            job_name, extend
+                        ));
+                    }
                 }
             }
         }
@@ -315,6 +363,39 @@ pub fn convert_to_workflow_format(pipeline: &Pipeline) -> workflow::WorkflowDefi
     workflow
 }
 
+/// Filter root-level YAML values to only keep entries that can be safely
+/// deserialized as part of `Pipeline`.
+///
+/// Entries whose values are mappings (potential jobs) or are known Pipeline
+/// fields are kept. Non-mapping, non-Pipeline-field entries (e.g., YAML anchor
+/// definitions that are arrays) are removed, because they would fail
+/// deserialization as `Job` via `#[serde(flatten)]`.
+fn filter_root_for_deserialization(yaml: &serde_yaml::Value) -> serde_yaml::Value {
+    let root_map = match yaml.as_mapping() {
+        Some(m) => m,
+        None => return yaml.clone(),
+    };
+
+    let known_fields: HashSet<&str> = PIPELINE_FIELDS.iter().copied().collect();
+
+    let mut new_map = serde_yaml::Mapping::new();
+    for (key, value) in root_map {
+        match key.as_str() {
+            Some(k) if known_fields.contains(k) || value.is_mapping() => {
+                new_map.insert(key.clone(), value.clone());
+            }
+            Some(_) => {
+                // Non-mapping, non-Pipeline-field → skip (would fail as Job)
+            }
+            None => {
+                // Non-string key → skip
+            }
+        }
+    }
+
+    serde_yaml::Value::Mapping(new_map)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -418,6 +499,8 @@ build:
 
     #[test]
     fn test_parse_pipeline_with_external_references() {
+        // When a !reference can't be resolved, the path array is flattened
+        // into the parent sequence (matching GitLab's inline behavior).
         let file = NamedTempFile::new().unwrap();
         let content = r#"
 stages:
@@ -436,14 +519,17 @@ build:
 
         let build_job = pipeline.jobs.get("build").unwrap();
         let rules = build_job.rules.as_ref().unwrap();
-        assert_eq!(rules.len(), 1);
+        assert_eq!(rules.len(), 2);
 
         match &rules[0] {
             wrkflw_models::gitlab::Rule::Raw(value) => {
-                let seq = value.as_sequence().unwrap();
-                assert_eq!(seq.len(), 2);
-                assert_eq!(seq[0].as_str().unwrap(), ".rules");
-                assert_eq!(seq[1].as_str().unwrap(), "except_config");
+                assert_eq!(value.as_str().unwrap(), ".rules");
+            }
+            _ => panic!("Expected Rule::Raw for unresolved reference"),
+        }
+        match &rules[1] {
+            wrkflw_models::gitlab::Rule::Raw(value) => {
+                assert_eq!(value.as_str().unwrap(), "except_config");
             }
             _ => panic!("Expected Rule::Raw for unresolved reference"),
         }
