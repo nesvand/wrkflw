@@ -326,16 +326,20 @@ pub mod gitlab {
 
     /// Rule for conditional job execution
     #[derive(Debug, Serialize, Deserialize, Clone)]
-    pub struct Rule {
-        /// If condition expression
-        #[serde(rename = "if", skip_serializing_if = "Option::is_none")]
-        pub if_: Option<String>,
-        /// When to run if condition is true
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub when: Option<String>,
-        /// Variables to set if condition is true
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub variables: Option<HashMap<String, String>>,
+    #[serde(untagged)]
+    pub enum Rule {
+        /// Normal structured rule with if/when/variables
+        Structured {
+            /// If condition expression
+            #[serde(rename = "if", skip_serializing_if = "Option::is_none")]
+            if_: Option<String>,
+            /// When to run if condition is true
+            #[serde(skip_serializing_if = "Option::is_none")]
+            when: Option<String>,
+            /// Variables to set if condition is true
+            #[serde(skip_serializing_if = "Option::is_none")]
+            variables: Option<HashMap<String, String>>,
+        },
     }
 
     /// Only/except configuration

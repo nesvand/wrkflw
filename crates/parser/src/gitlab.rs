@@ -1,3 +1,4 @@
+use crate::reference_resolver;
 use crate::schema::{SchemaType, SchemaValidator};
 use crate::workflow;
 use std::collections::HashMap;
@@ -27,15 +28,27 @@ pub fn parse_pipeline(pipeline_path: &Path) -> Result<Pipeline, GitlabParserErro
     // Read the pipeline file
     let pipeline_content = fs::read_to_string(pipeline_path)?;
 
+    // Parse YAML to serde_yaml::Value (preserves tags)
+    let raw_yaml: serde_yaml::Value =
+        serde_yaml::from_str(&pipeline_content).map_err(GitlabParserError::from)?;
+
+    // Resolve !reference tags
+    let resolved_yaml = reference_resolver::resolve_references(&raw_yaml);
+
+    // Convert resolved YAML to JSON for schema validation
+    let json_value: serde_json::Value = serde_json::to_value(&resolved_yaml).map_err(|e| {
+        GitlabParserError::InvalidStructure(format!("Failed to convert YAML to JSON: {}", e))
+    })?;
+
     // Validate against schema
     let validator = SchemaValidator::new().map_err(GitlabParserError::SchemaValidationError)?;
 
     validator
-        .validate_with_specific_schema(&pipeline_content, SchemaType::GitLab)
+        .validate_json_value(&json_value, SchemaType::GitLab)
         .map_err(GitlabParserError::SchemaValidationError)?;
 
-    // Parse the pipeline YAML
-    let pipeline: Pipeline = serde_yaml::from_str(&pipeline_content)?;
+    // Deserialize resolved YAML into Pipeline struct
+    let pipeline: Pipeline = serde_yaml::from_value(resolved_yaml)?;
 
     // Return the parsed pipeline
     Ok(pipeline)
@@ -264,5 +277,58 @@ test_job:
         let test_job = pipeline.jobs.get("test_job").unwrap();
         assert_eq!(test_job.stage.as_ref().unwrap(), "test");
         assert_eq!(test_job.script.as_ref().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_parse_pipeline_with_references() {
+        let file = NamedTempFile::new().unwrap();
+        let content = r#"
+.rules:
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+      when: always
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      when: manual
+
+build:
+  stage: build
+  script:
+    - echo "Building..."
+  rules: !reference [.rules, rules]
+"#;
+        fs::write(&file, content).unwrap();
+
+        let pipeline = parse_pipeline(file.path()).unwrap();
+
+        let build_job = pipeline.jobs.get("build").unwrap();
+        let rules = build_job.rules.as_ref().unwrap();
+        assert_eq!(rules.len(), 2);
+
+        match &rules[0] {
+            wrkflw_models::gitlab::Rule::Structured {
+                if_,
+                when,
+                variables,
+            } => {
+                assert_eq!(if_.as_deref(), Some("$CI_COMMIT_BRANCH == \"main\""));
+                assert_eq!(when.as_deref(), Some("always"));
+                assert!(variables.is_none());
+            }
+        }
+
+        match &rules[1] {
+            wrkflw_models::gitlab::Rule::Structured {
+                if_,
+                when,
+                variables,
+            } => {
+                assert_eq!(
+                    if_.as_deref(),
+                    Some("$CI_PIPELINE_SOURCE == \"merge_request_event\"")
+                );
+                assert_eq!(when.as_deref(), Some("manual"));
+                assert!(variables.is_none());
+            }
+        }
     }
 }
